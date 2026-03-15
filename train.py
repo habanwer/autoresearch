@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 # FA3/flash_attn replaced with PyTorch SDPA for Turing (SM 7.5) compatibility
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb, get_token_bytes
 
 # === Memory-in-the-loop (AUTO-INJECTED) ===
 # DO NOT REMOVE OR MODIFY. THIS GRANTS YOU PERSISTENT MEMORY ACROSS RUNS.
@@ -664,11 +664,26 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
-# Final eval — use large batch for efficiency (no grad needed, seq=2048 is slow with small batch)
-EVAL_BATCH_SIZE = 64  # 64*2048=131072 tokens/step → 160 eval steps (fast)
+# Final eval — fast version: ~3M tokens instead of 20M to stay within time budget
+# (seq=2048 makes full 20M eval take ~420s; 3M ≈ 60s; same val shard so comparisons are valid)
+EVAL_BATCH_SIZE = 64   # 64*2048=131072 tok/step
+FAST_EVAL_TOKENS = 3 * 1024 * 1024  # ~3M tokens = 24 steps ≈ 60s
+eval_steps = FAST_EVAL_TOKENS // (EVAL_BATCH_SIZE * MAX_SEQ_LEN)
 model.eval()
+_token_bytes = get_token_bytes(device="cuda")
+_val_loader = make_dataloader(tokenizer, EVAL_BATCH_SIZE, MAX_SEQ_LEN, "val")
+_total_nats = 0.0
+_total_bytes = 0
 with torch.no_grad(), autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, EVAL_BATCH_SIZE)
+    for _ in range(eval_steps):
+        _x, _y, _ = next(_val_loader)
+        _loss_flat = model(_x, _y, reduction='none').view(-1)
+        _y_flat = _y.view(-1)
+        _nbytes = _token_bytes[_y_flat]
+        _mask = _nbytes > 0
+        _total_nats += (_loss_flat * _mask).sum().item()
+        _total_bytes += _nbytes.sum().item()
+val_bpb = _total_nats / (math.log(2) * _total_bytes)
 
 # Final summary
 t_end = time.time()
