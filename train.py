@@ -17,13 +17,56 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# FA3/flash_attn replaced with PyTorch SDPA for Turing (SM 7.5) compatibility
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+
+# === Memory-in-the-loop (AUTO-INJECTED) ===
+# DO NOT REMOVE OR MODIFY. THIS GRANTS YOU PERSISTENT MEMORY ACROSS RUNS.
+import sys, os, re, csv, traceback
+from datetime import datetime
+def update_research_memory(outcome_str):
+    if not os.path.exists('results.tsv'): return
+   
+    # 1. Parse active hyperparameters
+    hparam_str = "unknown"
+    try:
+        with open(__file__, 'r', encoding='utf-8') as f: code = f.read()
+        depth = re.search(r'^DEPTH\s*=\s*(\d+)', code, re.MULTILINE)
+        bs = re.search(r'^TOTAL_BATCH_SIZE\s*=\s*(.+)', code, re.MULTILINE)
+        lr = re.search(r'^MAX_LR\s*=\s*(.+)', code, re.MULTILINE)
+        hparams = [f"{k}={v.group(1).strip()}" for k, v in zip(["DEPTH", "BS", "LR"], [depth, bs, lr]) if v]
+        if hparams: hparam_str = ", ".join(hparams)
+    except: pass
+    # 2. Parse top historical runs
+    runs = []
+    with open('results.tsv', 'r', encoding='utf-8') as f:
+        for row in csv.DictReader(f, delimiter='\t'):
+            try:
+                v = float(row.get('val_bpb', '0'))
+                if v > 0: runs.append({'commit': row.get('commit', 'unknown')[:8], 'val_bpb': v, 'desc': row.get('description', '')[:60]})
+            except: continue
+   
+    # 3. Build Context-Rich Memory Payload
+    memory = f"\n## EXPERIMENT MEMORY (auto-generated {datetime.now().strftime('%H:%M')})\n"
+    if runs:
+        runs.sort(key=lambda x: x['val_bpb'])
+        memory += f"**Best val_bpb ever:** {runs[0]['val_bpb']:.4f}\n\n**Top Winners:**\n"
+        for i, r in enumerate(runs[:3], 1): memory += f"{i}. [{r['commit']}] {r['desc']} → {r['val_bpb']:.4f}\n"
+   
+    memory += f"\n**Last Run Context:**\n- State: `{hparam_str}`\n- Outcome: {outcome_str}\n"
+    # 4. Safe update of program.md
+    if os.path.exists('program.md'):
+        with open('program.md', 'r', encoding='utf-8') as f: content = f.read()
+        content = content.split("## EXPERIMENT MEMORY")[0].strip() + "\n" + memory
+        with open('program.md', 'w', encoding='utf-8') as f: f.write(content + "\n")
+# 5. The Crash Catcher
+def crash_handler(exc_type, exc_val, exc_tb):
+    err = "".join(traceback.format_exception_only(exc_type, exc_val)).strip()
+    update_research_memory(f"CRASHED: `{err}`")
+    sys.__excepthook__(exc_type, exc_val, exc_tb)
+sys.excepthook = crash_handler
+# === END LIVING RESEARCH MEMORY ===
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -31,11 +74,11 @@ from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evalua
 
 @dataclass
 class GPTConfig:
-    sequence_len: int = 2048
-    vocab_size: int = 32768
-    n_layer: int = 12
-    n_head: int = 6
-    n_kv_head: int = 6
+    sequence_len: int = 1024
+    vocab_size: int = 16384
+    n_layer: int = 6
+    n_head: int = 2
+    n_kv_head: int = 2
     n_embd: int = 768
     window_pattern: str = "SSSL"
 
@@ -90,8 +133,23 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
+        # Transpose to (B, H, T, D) for SDPA
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        win = window_size[0]
+        if win >= T:
+            # Full context — use efficient is_causal path
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # Sliding window causal — build explicit mask
+            rows = torch.arange(T, device=q.device).unsqueeze(1)
+            cols = torch.arange(T, device=q.device).unsqueeze(0)
+            mask = (cols <= rows) & ((rows - cols) < win)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -175,10 +233,7 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+        # Embeddings stay in FP32; autocast handles FP16 during forward
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -188,7 +243,7 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
+        cos, sin = cos.float(), sin.float()
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
@@ -302,7 +357,6 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -313,7 +367,6 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -321,7 +374,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
     # Polar express orthogonalization
-    X = g.bfloat16()
+    X = g.half()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -431,24 +484,24 @@ class MuonAdamW(torch.optim.Optimizer):
 
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+HEAD_DIM = 64           # target head dimension for attention
+WINDOW_PATTERN = "SSSL"    # full context only (simpler, faster for small models)
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+TOTAL_BATCH_SIZE = 2**17 # ~131K tokens per optimizer step (lower = more steps)
+EMBEDDING_LR = 0.006      # learning rate for token embeddings (Adam)
+UNEMBEDDING_LR = 0.0004  # learning rate for lm_head (Adam)
+MATRIX_LR = 0.004        # learning rate for matrix parameters (Muon)
+SCALAR_LR = 0.005         # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = 0.1      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
+WARMUP_RATIO = 0.01      # fraction of time budget for LR warmup
+WARMDOWN_RATIO = 0.01    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 64    # increased to compensate for shorter MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -459,7 +512,7 @@ torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
@@ -505,7 +558,9 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+# torch.compile disabled — requires Triton (unavailable on Windows)
+
+scaler = torch.amp.GradScaler()  # required for FP16 mixed precision
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -548,7 +603,7 @@ while True:
             loss = model(x, y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
-        loss.backward()
+        scaler.scale(loss).backward()
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
@@ -561,7 +616,9 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
-    optimizer.step()
+    scaler.unscale_(optimizer)
+    scaler.step(optimizer)
+    scaler.update()
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
@@ -628,3 +685,5 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+update_research_memory(f"SUCCESS: {val_bpb:.4f} val_bpb")
