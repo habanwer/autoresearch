@@ -488,7 +488,7 @@ HEAD_DIM = 64           # target head dimension for attention
 WINDOW_PATTERN = "SSSL"    # full context only (simpler, faster for small models)
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**17 # ~131K tokens per optimizer step (lower = more steps)
+TOTAL_BATCH_SIZE = 2**15 # ~32K tokens per optimizer step — 1 grad_accum step, max throughput
 EMBEDDING_LR = 0.006      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.0004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.004        # learning rate for matrix parameters (Muon)
