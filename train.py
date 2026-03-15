@@ -485,7 +485,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 64           # target head dimension for attention
-WINDOW_PATTERN = "SSSL"    # full context only (simpler, faster for small models)
+WINDOW_PATTERN = "L"       # all full-context attention: uses is_causal=True (efficient SDPA, no T^2 mask)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**15 # ~32K tokens per optimizer step — 1 grad_accum step, max throughput
@@ -501,7 +501,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 64    # increased to compensate for shorter MAX_SEQ_LEN
+DEVICE_BATCH_SIZE = 16    # seq=2048: 16*2048=32768=2**15 tokens per fwd (1 grad_accum step)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -664,10 +664,11 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
-# Final eval
+# Final eval — use large batch for efficiency (no grad needed, seq=2048 is slow with small batch)
+EVAL_BATCH_SIZE = 64  # 64*2048=131072 tokens/step → 160 eval steps (fast)
 model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+with torch.no_grad(), autocast_ctx:
+    val_bpb = evaluate_bpb(model, tokenizer, EVAL_BATCH_SIZE)
 
 # Final summary
 t_end = time.time()
