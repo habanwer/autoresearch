@@ -1,0 +1,5 @@
+commit	val_bpb	memory_gb	status	description
+3208d76	2.355403	10.4	keep	baseline depth=8 head_dim=64 batch=64 total_bs=2**17
+7a86511	2.039419	10.3	keep	total_bs=2**15 1 grad_accum step more throughput
+6e5f416	2.092465	10.3	discard	warmdown_ratio=0.3 hurt training (less effective time at full LR)
+bfe3aef	N/A	N/A	crash	seq=2048 eval too slow (640 steps), killed after 14min
