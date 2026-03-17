@@ -19,7 +19,6 @@ import torch.nn.functional as F
 
 import json
 import sys
-import re
 import csv
 import traceback
 from datetime import datetime
@@ -142,6 +141,7 @@ def has_ve(layer_idx, n_layer):
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
+    cos, sin = cos.to(x.dtype), sin.to(x.dtype)
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
     y1 = x1 * cos + x2 * sin
@@ -199,6 +199,7 @@ class CausalSelfAttention(nn.Module):
             if self._cached_mask_key != key:
                 rows = torch.arange(T, device=q.device).unsqueeze(1)
                 cols = torch.arange(T, device=q.device).unsqueeze(0)
+                # Causal + sliding window: True = allowed to attend (PyTorch SDPA convention)
                 self._cached_mask = (cols <= rows) & ((rows - cols) < win)
                 self._cached_mask_key = key
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=self._cached_mask)
@@ -297,7 +298,6 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.float(), sin.float()
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
@@ -622,7 +622,8 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-# torch.compile disabled — requires Triton (unavailable on Windows)
+if PLATFORM["compile"]:
+    model = torch.compile(model)
 
 scaler = torch.amp.GradScaler(enabled=PLATFORM["use_grad_scaler"])
 
@@ -732,7 +733,7 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # (seq=2048 makes full 20M eval take ~420s; 3M ≈ 60s; same val shard so comparisons are valid)
 EVAL_BATCH_SIZE = _model_cfg["evaluation"]["batch_size"]
 FAST_EVAL_TOKENS = _model_cfg["evaluation"]["tokens"]
-eval_steps = FAST_EVAL_TOKENS // (EVAL_BATCH_SIZE * MAX_SEQ_LEN)
+eval_steps = max(1, FAST_EVAL_TOKENS // (EVAL_BATCH_SIZE * MAX_SEQ_LEN))
 model.eval()
 _token_bytes = get_token_bytes(device="cuda")
 _val_loader = make_dataloader(tokenizer, EVAL_BATCH_SIZE, MAX_SEQ_LEN, "val")

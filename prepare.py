@@ -25,12 +25,23 @@ import json
 import torch
 
 # ---------------------------------------------------------------------------
-# Constants — loaded from ground.json when available, else hardcoded defaults
+# Constants — loaded from ground.json (required); fail with clear message
 # ---------------------------------------------------------------------------
 
 _GROUND_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ground.json")
-with open(_GROUND_PATH, "r", encoding="utf-8") as _f:
-    _ground = json.load(_f)
+try:
+    with open(_GROUND_PATH, "r", encoding="utf-8") as _f:
+        _ground = json.load(_f)
+except FileNotFoundError:
+    sys.exit(f"ERROR: ground.json not found at {_GROUND_PATH}. "
+             "This file is required — see README.md for setup instructions.")
+except json.JSONDecodeError as _e:
+    sys.exit(f"ERROR: ground.json is malformed: {_e}")
+
+_required_keys = ["training", "data", "tokenizer", "mode", "processor"]
+_missing = [k for k in _required_keys if k not in _ground]
+if _missing:
+    sys.exit(f"ERROR: ground.json missing required keys: {_missing}")
 
 _training = _ground["training"]
 _data = _ground["data"]

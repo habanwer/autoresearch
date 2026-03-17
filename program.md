@@ -54,8 +54,10 @@ Use these to guide your experiment choices:
 2. Initialize `results.tsv` with this exact header (tab-separated):
 
    ```
-   run_id val_bpb peak_vram_mb mfu_percent training_seconds total_tokens_M num_params_M status description
+   run_id\tval_bpb\tpeak_vram_mb\tmfu_percent\ttraining_seconds\ttotal_tokens_M\tnum_params_M\tstatus\tdescription
    ```
+
+   (Each `\t` above represents a literal tab character.)
 
 3. Run `uv run train.py`, capturing stdout to `sessions/<run_id>.log`.
    - `run_id` = short git commit hash or a timestamp tag — unique per run.
